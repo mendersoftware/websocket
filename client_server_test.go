@@ -920,3 +920,270 @@ func TestEmptyTracingDialWithContext(t *testing.T) {
 	defer ws.Close()
 	sendRecv(t, ws)
 }
+
+// TestNetDialConnect tests selection of dial method between NetDial, NetDialContext, NetDialTLS or NetDialTLSContext
+func TestNetDialConnect(t *testing.T) {
+
+	upgrader := Upgrader{}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if IsWebSocketUpgrade(r) {
+			c, err := upgrader.Upgrade(w, r, http.Header{"X-Test-Host": {r.Host}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.Close()
+		} else {
+			w.Header().Set("X-Test-Host", r.Host)
+		}
+	})
+
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	tlsServer := httptest.NewTLSServer(handler)
+	defer tlsServer.Close()
+
+	testUrls := map[*httptest.Server]string{
+		server:    "ws://" + server.Listener.Addr().String() + "/",
+		tlsServer: "wss://" + tlsServer.Listener.Addr().String() + "/",
+	}
+
+	cas := rootCAs(t, tlsServer)
+	tlsConfig := &tls.Config{
+		RootCAs:            cas,
+		ServerName:         "example.com",
+		InsecureSkipVerify: false,
+	}
+
+	tests := map[string]struct {
+		server            *httptest.Server // server to use
+		netDial           func(network, addr string) (net.Conn, error)
+		netDialContext    func(ctx context.Context, network, addr string) (net.Conn, error)
+		netDialTLS        func(network, addr string) (net.Conn, error)
+		netDialTLSContext func(ctx context.Context, network, addr string) (net.Conn, error)
+		tlsClientConfig   *tls.Config
+	}{
+		"HTTP server, all NetDial* defined, shall use NetDialContext": {
+			server: server,
+			netDial: func(network, addr string) (net.Conn, error) {
+				t.Error("NetDial should not be called")
+				t.FailNow()
+				return nil, nil
+			},
+			netDialContext: func(_ context.Context, network, addr string) (net.Conn, error) {
+				return net.Dial(network, addr)
+			},
+			netDialTLS: func(network, addr string) (net.Conn, error) {
+				t.Error("NetDialTLS should not be called")
+				t.FailNow()
+				return nil, nil
+			},
+			netDialTLSContext: func(_ context.Context, network, addr string) (net.Conn, error) {
+				t.Error("NetDialTLSContext should not be called")
+				t.FailNow()
+				return nil, nil
+			},
+			tlsClientConfig: nil,
+		},
+		"HTTP server, all NetDial* undefined": {
+			server:            server,
+			netDial:           nil,
+			netDialContext:    nil,
+			netDialTLS:        nil,
+			netDialTLSContext: nil,
+			tlsClientConfig:   nil,
+		},
+		"HTTP server, NetDialContext undefined, shall fallback to NetDial": {
+			server: server,
+			netDial: func(network, addr string) (net.Conn, error) {
+				return net.Dial(network, addr)
+			},
+			netDialContext: nil,
+			netDialTLS: func(network, addr string) (net.Conn, error) {
+				t.Error("NetDialTLS should not be called")
+				t.FailNow()
+				return nil, nil
+			},
+			netDialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				t.Error("NetDialTLSContext should not be called")
+				t.FailNow()
+				return nil, nil
+			},
+			tlsClientConfig: nil,
+		},
+		"HTTPS server, all NetDial* defined, shall use NetDialTLSContext": {
+			server: tlsServer,
+			netDial: func(network, addr string) (net.Conn, error) {
+				t.Error("NetDial should not be called")
+				t.FailNow()
+				return nil, nil
+			},
+			netDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				t.Error("NetDialContext should not be called")
+				t.FailNow()
+				return nil, nil
+			},
+			netDialTLS: func(network, addr string) (net.Conn, error) {
+				t.Error("NetDialTLS should not be called")
+				t.FailNow()
+				return nil, nil
+			},
+			netDialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				netConn, err := net.Dial(network, addr)
+				if err != nil {
+					return nil, err
+				}
+				tlsConn := tls.Client(netConn, tlsConfig)
+				err = tlsConn.Handshake()
+				if err != nil {
+					return nil, err
+				}
+				return tlsConn, nil
+			},
+			tlsClientConfig: nil,
+		},
+		"HTTPS server, NetDialTLSContext undefined, shall fallback to NetTLSDial": {
+			server: tlsServer,
+			netDial: func(network, addr string) (net.Conn, error) {
+				t.Error("NetDial should not be called")
+				t.FailNow()
+				return nil, nil
+			},
+			netDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				t.Error("NetDialContext should not be called")
+				t.FailNow()
+				return nil, nil
+			},
+			netDialTLS: func(network, addr string) (net.Conn, error) {
+				netConn, err := net.Dial(network, addr)
+				if err != nil {
+					return nil, err
+				}
+				tlsConn := tls.Client(netConn, tlsConfig)
+				err = tlsConn.Handshake()
+				if err != nil {
+					return nil, err
+				}
+				return tlsConn, nil
+			},
+			netDialTLSContext: nil,
+			tlsClientConfig:   nil,
+		},
+		"HTTPS server, NetDialTLS* undefined, shall fallback to NetDialContext and do handshake": {
+			server: tlsServer,
+			netDial: func(network, addr string) (net.Conn, error) {
+				t.Error("NetDial should not be called")
+				t.FailNow()
+				return nil, nil
+			},
+			netDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return net.Dial(network, addr)
+			},
+			netDialTLS:        nil,
+			netDialTLSContext: nil,
+			tlsClientConfig:   tlsConfig,
+		},
+		"HTTPS server, NetDialTLS* and NetDialContext undefined, shall fallback to NetDial and do handshake": {
+			server: tlsServer,
+			netDial: func(network, addr string) (net.Conn, error) {
+				return net.Dial(network, addr)
+			},
+			netDialContext:    nil,
+			netDialTLS:        nil,
+			netDialTLSContext: nil,
+			tlsClientConfig:   tlsConfig,
+		},
+		"HTTPS server, all NetDial* undefined": {
+			server:            tlsServer,
+			netDial:           nil,
+			netDialContext:    nil,
+			netDialTLS:        nil,
+			netDialTLSContext: nil,
+			tlsClientConfig:   tlsConfig,
+		},
+		"HTTPS server, all NetDialTLSContext defined, dummy TlsClientConfig defined, shall not do handshake": {
+			server: tlsServer,
+			netDial: func(network, addr string) (net.Conn, error) {
+				t.Error("NetDial should not be called")
+				t.FailNow()
+				return nil, nil
+			},
+			netDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				t.Error("NetDialContext should not be called")
+				t.FailNow()
+				return nil, nil
+			},
+			netDialTLS: func(network, addr string) (net.Conn, error) {
+				t.Error("NetDialTLS should not be called")
+				t.FailNow()
+				return nil, nil
+			},
+			netDialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				netConn, err := net.Dial(network, addr)
+				if err != nil {
+					return nil, err
+				}
+				tlsConn := tls.Client(netConn, tlsConfig)
+				err = tlsConn.Handshake()
+				if err != nil {
+					return nil, err
+				}
+				return tlsConn, nil
+			},
+			tlsClientConfig: &tls.Config{
+				RootCAs:            nil,
+				ServerName:         "badserver.com",
+				InsecureSkipVerify: false,
+			},
+		},
+		"HTTPS server, NetDialTLS defined, dummy TlsClientConfig defined, shall not do handshake": {
+			server: tlsServer,
+			netDial: func(network, addr string) (net.Conn, error) {
+				t.Error("NetDial should not be called")
+				t.FailNow()
+				return nil, nil
+			},
+			netDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				t.Error("NetDialContext should not be called")
+				t.FailNow()
+				return nil, nil
+			},
+			netDialTLS: func(network, addr string) (net.Conn, error) {
+				netConn, err := net.Dial(network, addr)
+				if err != nil {
+					return nil, err
+				}
+				tlsConn := tls.Client(netConn, tlsConfig)
+				err = tlsConn.Handshake()
+				if err != nil {
+					return nil, err
+				}
+				return tlsConn, nil
+			},
+			netDialTLSContext: nil,
+			tlsClientConfig: &tls.Config{
+				RootCAs:            nil,
+				ServerName:         "badserver.com",
+				InsecureSkipVerify: false,
+			},
+		},
+	}
+
+	for name, tc := range tests {
+		dialer := Dialer{
+			NetDial:           tc.netDial,
+			NetDialContext:    tc.netDialContext,
+			NetDialTLS:        tc.netDialTLS,
+			NetDialTLSContext: tc.netDialTLSContext,
+			TLSClientConfig:   tc.tlsClientConfig,
+		}
+
+		// Test websocket dial
+		c, _, err := dialer.Dial(testUrls[tc.server], nil)
+		if err != nil {
+			t.Errorf("FAILED %s, err: %s", name, err.Error())
+		} else {
+			c.Close()
+		}
+	}
+}
